@@ -1432,6 +1432,7 @@ class BulkAccountRequest(BaseModel):
     text: str  # 原始文本，从中提取账号信息
 
 
+
 def extract_email_from_account(account_data: Dict[str, str]) -> Optional[str]:
     """
     从账号信息中提取邮箱
@@ -1497,6 +1498,7 @@ def extract_accounts_from_text(text: str) -> List[Dict[str, str]]:
             continue
         
         # 尝试匹配各个字段
+
         # EMAIL（优先）
         value = extract_value(line, r'(?:EMAIL|email)')
         if value:
@@ -1535,7 +1537,9 @@ def extract_accounts_from_text(text: str) -> List[Dict[str, str]]:
         
         # 也支持 ACCOUNT1_NAME="value" 这种格式
         account_match = re.match(
+
             r'ACCOUNT\d+_(NAME|EMAIL|SECURE_C_SES|CSESIDX|CONFIG_ID|HOST_C_OSES)\s*=\s*["\']?([^"\']+)["\']?',
+
             line,
             re.IGNORECASE
         )
@@ -1544,8 +1548,10 @@ def extract_accounts_from_text(text: str) -> List[Dict[str, str]]:
             value = account_match.group(2).strip()
             if key == 'name':
                 current_account['name'] = value
+
             elif key == 'email':
                 current_account['email'] = value
+
             elif key == 'secure_c_ses':
                 current_account['secure_c_ses'] = value
             elif key == 'csesidx':
@@ -1565,10 +1571,12 @@ def extract_accounts_from_text(text: str) -> List[Dict[str, str]]:
         blocks = re.split(r'\n\s*\n+', text)
         for block in blocks:
             account = {}
+
             # EMAIL
             value = extract_value(block, r'(?:EMAIL|email)')
             if value:
                 account['email'] = value
+
             # NAME
             value = extract_value(block, r'(?:NAME|name)')
             if value:
@@ -1613,6 +1621,7 @@ async def create_accounts_bulk(
     lines = read_env_file()
     accounts = parse_accounts_from_env_lines(lines)
     
+
     # 获取已存在账号的邮箱集合（用于去重）
     existing_emails = set()
     for acc in accounts:
@@ -1635,7 +1644,9 @@ async def create_accounts_bulk(
     
     created_accounts = []
     skipped_accounts = []
+
     seen_emails_in_batch = set()  # 用于批量添加内部的邮箱去重
+
     
     new_lines = []
     
@@ -1655,6 +1666,7 @@ async def create_accounts_bulk(
             })
             continue
         
+<<<<<<< HEAD
         # 提取邮箱
         current_account_data = {
             "name": name,
