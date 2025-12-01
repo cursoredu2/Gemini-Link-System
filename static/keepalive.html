@@ -5,6 +5,9 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>保活策略</title>
+    <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
+    <meta http-equiv="Pragma" content="no-cache">
+    <meta http-equiv="Expires" content="0">
     <link rel="stylesheet" href="/static/style.css">
     <style>
         body {
@@ -58,35 +61,16 @@
     <div class="keep-alive-container">
         <div style="flex: 1; overflow: hidden; display: flex; gap: 1rem;">
             <!-- 左侧：配置区域 -->
-            <div style="flex: 1; min-width: 0; display: flex; flex-direction: column; overflow-y: auto;">
+            <div style="flex: 0 0 50%; min-width: 0; display: flex; flex-direction: column; overflow-y: auto;">
                 <div id="keepAliveContent" style="padding: 0;">
                     <div class="loading">加载中...</div>
                 </div>
             </div>
             
-            <!-- 右侧：实时日志和账号详情 -->
-            <div style="width: 500px; flex-shrink: 0; display: flex; flex-direction: column; gap: 1rem; border-left: 1px solid var(--border-color); padding-left: 1rem;">
-                <!-- 实时日志区域 -->
-                <div style="flex: 1; min-height: 0; display: flex; flex-direction: column;">
-                    <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.75rem;">
-                        <h3 style="margin: 0; font-size: 0.95rem; color: var(--text-primary); display: flex; align-items: center; gap: 0.5rem;">
-                            <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                                <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"></path>
-                                <polyline points="14 2 14 8 20 8"></polyline>
-                                <line x1="16" y1="13" x2="8" y2="13"></line>
-                                <line x1="16" y1="17" x2="8" y2="17"></line>
-                            </svg>
-                            实时日志
-                        </h3>
-                        <button class="btn-secondary" onclick="clearKeepAliveLogs()" style="font-size: 0.75rem; padding: 0.35rem 0.75rem;">清空日志</button>
-                    </div>
-                    <div id="keepAliveRealtimeLogs" style="flex: 1; overflow-y: auto; background: rgba(15, 23, 42, 0.6); border: 1px solid var(--border-color); border-radius: var(--radius-md); padding: 1rem; font-family: 'Consolas', 'Monaco', 'Courier New', monospace; font-size: 0.8rem; line-height: 1.6; color: var(--text-secondary); min-height: 0;">
-                        <div style="color: var(--text-tertiary); text-align: center; padding: 2rem;">等待日志输出...</div>
-                    </div>
-                </div>
-                
+            <!-- 右侧：日志详情 -->
+            <div style="flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 1rem; border-left: 1px solid var(--border-color); padding-left: 1rem;">
                 <!-- 日志详情区域 -->
-                <div id="keepAliveAccountLogs" style="display: none; flex: 1; min-height: 0; display: flex; flex-direction: column; border-top: 1px solid var(--border-color); padding-top: 1rem;">
+                <div id="keepAliveAccountLogs" style="flex: 1; min-height: 0; display: flex; flex-direction: column;">
                     <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.75rem;">
                         <h3 style="margin: 0; font-size: 0.95rem; color: var(--text-primary); display: flex; align-items: center; gap: 0.5rem;">
                             <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
@@ -97,10 +81,9 @@
                             </svg>
                             日志详情
                         </h3>
-                        <button class="btn-secondary" onclick="closeAccountLogs()" style="font-size: 0.75rem; padding: 0.35rem 0.75rem;">关闭</button>
                     </div>
-                    <div class="table-container" style="flex: 1; overflow-y: auto; border: 1px solid var(--border-color); border-radius: var(--radius-md); min-height: 0;">
-                        <div class="loading">加载中...</div>
+                    <div id="keepAliveAccountLogsContent" class="table-container" style="flex: 1; overflow-y: auto; border: 1px solid var(--border-color); border-radius: var(--radius-md); min-height: 0;">
+                        <div style="color: var(--text-tertiary); text-align: center; padding: 2rem;">点击执行历史中的"查看详情"查看日志</div>
                     </div>
                 </div>
             </div>
@@ -110,8 +93,9 @@
     <script src="/static/app.js"></script>
     <script>
         // ========== 保活策略管理 ==========
-        let keepAliveLogs = [];
         let keepAliveModalOpen = true; // 在 iframe 中始终为 true
+        let currentLogId = null; // 当前显示的日志ID
+        let expandedAccounts = new Set(); // 展开的账号详情
         
         // 通知父窗口模态框已打开
         function notifyParentModalOpen() {
@@ -143,8 +127,14 @@
                     if (status && status.is_running) {
                         // 只更新状态和日志，不重新渲染整个内容
                         updateKeepAliveStatusOnly();
-                        loadRealtimeLogs();
                         loadKeepAliveLogs(); // 更新执行历史
+                        // 如果当前显示的是正在执行的任务，刷新账号日志
+                        if (currentLogId) {
+                            loadAccountLogs(currentLogId, true);
+                        } else {
+                            // 如果没有显示任何日志，自动加载正在执行的任务
+                            autoLoadRunningLog();
+                        }
                     } else {
                         // 任务已完成，停止自动刷新
                         clearInterval(window.keepAliveInterval);
@@ -161,14 +151,9 @@
             }
         }
         
-        function clearKeepAliveLogs() {
-            keepAliveLogs = [];
-            renderRealtimeLogs();
-        }
-        
-        async function loadRealtimeLogs() {
+        // 自动加载正在运行的任务日志
+        async function autoLoadRunningLog() {
             try {
-                // 获取最新的任务日志
                 const response = await apiRequest('/admin/keep-alive/logs?page=1&page_size=1');
                 if (!response.ok) return;
                 
@@ -176,119 +161,13 @@
                 if (logs.length === 0) return;
                 
                 const latestLog = logs[0];
-                
-                // 如果是运行中的任务，获取账号级别日志
                 if (latestLog.status === 'running') {
-                    const accountLogsResponse = await apiRequest(`/admin/keep-alive/logs/${latestLog.id}/accounts`);
-                    if (accountLogsResponse.ok) {
-                        const accountLogs = await accountLogsResponse.json();
-                        // 更新实时日志 - 从每个账号日志的 message 中解析所有日志行
-                        accountLogs.forEach(log => {
-                            if (log.message) {
-                                // message 可能包含多行日志，用换行符分割
-                                const logLines = log.message.split('\n');
-                                logLines.forEach(line => {
-                                    if (line.trim()) {
-                                        // 检查是否已经存在（通过时间戳和内容判断）
-                                        const timeMatch = line.match(/\[(\d{2}:\d{2}:\d{2})\]/);
-                                        const logKey = timeMatch ? timeMatch[1] + line.substring(line.indexOf(']') + 1).trim() : line.trim();
-                                        
-                                        // 检查是否已存在
-                                        const exists = keepAliveLogs.some(existingLog => {
-                                            const existingTimeMatch = existingLog.match(/\[(\d{2}:\d{2}:\d{2})\]/);
-                                            const existingKey = existingTimeMatch ? existingTimeMatch[1] + existingLog.substring(existingLog.indexOf(']') + 1).trim() : existingLog.trim();
-                                            return existingKey === logKey;
-                                        });
-                                        
-                                        if (!exists) {
-                                            keepAliveLogs.push(line.trim());
-                                        }
-                                    }
-                                });
-                            }
-                        });
-                        
-                        // 只保留最近100条
-                        if (keepAliveLogs.length > 100) {
-                            keepAliveLogs = keepAliveLogs.slice(-100);
-                        }
-                    }
+                    currentLogId = latestLog.id;
+                    loadAccountLogs(latestLog.id, true);
                 }
-                
-                // 如果有消息（包括汇总信息），也添加到日志
-                if (latestLog.message && latestLog.status !== 'running') {
-                    // message 可能包含汇总信息（多行），需要分割显示
-                    const messageLines = latestLog.message.split('\n');
-                    messageLines.forEach(line => {
-                        if (line.trim()) {
-                            const time = new Date(latestLog.started_at).toLocaleTimeString('zh-CN', { 
-                                timeZone: 'Asia/Shanghai',
-                                hour: '2-digit',
-                                minute: '2-digit',
-                                second: '2-digit'
-                            });
-                            // 判断是否是汇总信息（包含 "总账号数"、"成功"、"失败" 等）
-                            const isSummary = /总账号数|成功:|失败:|成功率|总耗时|更新统计|^=+$/.test(line);
-                            let prefix;
-                            if (latestLog.status === 'cancelled') {
-                                prefix = isSummary ? `[${time}] 📊 ` : `[${time}] 🛑 任务中断: `;
-                            } else {
-                                prefix = isSummary ? `[${time}] 📊 ` : `[${time}] ${latestLog.status === 'success' ? '✅' : '❌'} 任务${latestLog.status === 'success' ? '完成' : '失败'}: `;
-                            }
-                            const logLine = prefix + line.trim();
-                            if (!keepAliveLogs.includes(logLine)) {
-                                keepAliveLogs.push(logLine);
-                            }
-                        }
-                    });
-                }
-                
-                renderRealtimeLogs();
             } catch (error) {
-                console.error('加载实时日志失败:', error);
+                console.error('自动加载运行中日志失败:', error);
             }
-        }
-        
-        function renderRealtimeLogs() {
-            const container = document.getElementById('keepAliveRealtimeLogs');
-            if (keepAliveLogs.length === 0) {
-                container.innerHTML = '<div style="color: var(--text-tertiary);">等待日志输出...</div>';
-                return;
-            }
-            
-            container.innerHTML = keepAliveLogs.map(log => {
-                // 判断是否是账号级别日志（包含 [数字/数字] 开始更新账号）
-                const isAccountLevelLog = /\[\d+\/\d+\]\s*(开始更新|更新成功|更新失败).*?账号:/.test(log);
-                // 判断是否是汇总信息
-                const isSummary = /总账号数|成功:|失败:|成功率|总耗时|更新统计|^=+$/.test(log);
-                
-                // 根据日志类型设置颜色和字体大小
-                let color = 'var(--text-secondary)';
-                let fontSize = '0.75rem'; // 默认小字体
-                let fontWeight = '400'; // 默认正常字重
-                
-                if (isAccountLevelLog || isSummary) {
-                    fontSize = '0.9rem'; // 账号级别日志和汇总信息用大字体
-                    fontWeight = '600'; // 加粗
-                }
-                
-                if (log.includes('✅')) color = '#10b981'; // 绿色
-                else if (log.includes('❌')) color = '#ef4444'; // 红色
-                else if (log.includes('🛑')) color = '#f59e0b'; // 橙色
-                else if (log.includes('⏳')) color = '#3b82f6'; // 蓝色
-                else if (log.includes('📊')) color = '#8b5cf6'; // 紫色（汇总信息）
-                
-                return `<div style="color: ${color}; font-size: ${fontSize}; font-weight: ${fontWeight}; margin-bottom: 0.25rem; word-break: break-word;">${escapeHtml(log)}</div>`;
-            }).join('');
-            
-            // 自动滚动到底部
-            container.scrollTop = container.scrollHeight;
-        }
-        
-        function escapeHtml(text) {
-            const div = document.createElement('div');
-            div.textContent = text;
-            return div.innerHTML;
         }
 
         async function loadKeepAliveTask() {
@@ -511,7 +390,7 @@
                 // 立即加载一次
                 setTimeout(() => {
                     loadKeepAliveTask();
-                    loadRealtimeLogs();
+                    autoLoadRunningLog();
                 }, 2000);
             } catch (error) {
                 alert('执行失败: ' + error.message);
@@ -529,10 +408,14 @@
                 const logs = await response.json();
                 renderKeepAliveLogs(logs);
                 
-                // 检查是否有正在运行的任务，如果有则开始自动刷新
+                // 检查是否有正在运行的任务，如果有则开始自动刷新并自动加载日志
                 const status = await checkKeepAliveStatus();
                 if (status && status.is_running) {
                     startKeepAliveAutoRefresh();
+                    // 自动加载正在执行的任务日志
+                    if (!currentLogId) {
+                        autoLoadRunningLog();
+                    }
                 } else {
                     stopKeepAliveAutoRefresh();
                 }
@@ -603,7 +486,6 @@
                             <th style="padding: 0.5rem;">状态</th>
                             <th style="padding: 0.5rem;">账号数</th>
                             <th style="padding: 0.5rem;">成功/失败</th>
-                            <th style="padding: 0.5rem;">消息</th>
                             <th style="padding: 0.5rem;">操作</th>
                         </tr>
                     </thead>
@@ -632,9 +514,6 @@
                                     <td style="padding: 0.5rem;"><span class="status-badge ${statusClass}">${statusText}</span></td>
                                     <td style="padding: 0.5rem;">${log.accounts_count || '-'}</td>
                                     <td style="padding: 0.5rem;">${log.success_count || 0}/${log.fail_count || 0}</td>
-                                    <td style="padding: 0.5rem; max-width: 200px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;" title="${(log.message || '').replace(/"/g, '&quot;')}">
-                                        ${(log.message || '-').replace(/</g, '&lt;').replace(/>/g, '&gt;')}
-                                    </td>
                                     <td style="padding: 0.5rem;">
                                         <div style="display: flex; gap: 0.25rem;">
                                             <button class="btn-secondary" onclick="loadAccountLogs(${log.id})" style="font-size: 0.75rem; padding: 0.25rem 0.5rem;">查看详情</button>
@@ -649,13 +528,13 @@
             `;
         }
 
-        async function loadAccountLogs(logId) {
-            const accountLogsContainer = document.getElementById('keepAliveAccountLogs');
-            const accountLogsContent = accountLogsContainer.querySelector('.table-container');
+        async function loadAccountLogs(logId, silent = false) {
+            const accountLogsContent = document.getElementById('keepAliveAccountLogsContent');
             
-            // 显示账号详情区域
-            accountLogsContainer.style.display = 'flex';
-            accountLogsContent.innerHTML = '<div class="loading">加载中...</div>';
+            if (!silent) {
+                currentLogId = logId;
+                accountLogsContent.innerHTML = '<div class="loading">加载中...</div>';
+            }
             
             try {
                 const response = await apiRequest(`/admin/keep-alive/logs/${logId}/accounts`);
@@ -665,16 +544,13 @@
                 }
                 
                 const accountLogs = await response.json();
-                renderAccountLogs(accountLogs, accountLogsContent);
+                renderAccountLogs(accountLogs, accountLogsContent, logId);
             } catch (error) {
                 console.error('加载账号日志失败:', error);
-                accountLogsContent.innerHTML = '<div class="error-message">加载失败</div>';
+                if (!silent) {
+                    accountLogsContent.innerHTML = '<div class="error-message">加载失败</div>';
+                }
             }
-        }
-        
-        function closeAccountLogs() {
-            const accountLogsContainer = document.getElementById('keepAliveAccountLogs');
-            accountLogsContainer.style.display = 'none';
         }
         
         function toggleSelectAllLogs(checked) {
@@ -754,28 +630,42 @@
             }
         }
 
-        function renderAccountLogs(accountLogs, container) {
+        function toggleAccountDetail(accountId) {
+            if (expandedAccounts.has(accountId)) {
+                expandedAccounts.delete(accountId);
+            } else {
+                expandedAccounts.add(accountId);
+            }
+            // 重新渲染以更新展开状态
+            if (currentLogId) {
+                loadAccountLogs(currentLogId, true);
+            }
+        }
+        
+        function renderAccountLogs(accountLogs, container, logId) {
             if (accountLogs.length === 0) {
                 container.innerHTML = '<div style="padding: 2rem; text-align: center; color: var(--text-tertiary);">暂无日志详情</div>';
                 return;
             }
             
             container.innerHTML = `
-                <table style="width: 100%; font-size: 0.75rem;">
+                <table style="width: 100%; font-size: 0.875rem;">
                     <thead>
                         <tr style="background: rgba(30, 41, 59, 0.5);">
+                            <th style="padding: 0.5rem; text-align: left; width: 30px;"></th>
                             <th style="padding: 0.5rem; text-align: left;">账号</th>
                             <th style="padding: 0.5rem; text-align: left;">开始时间</th>
                             <th style="padding: 0.5rem; text-align: left;">结束时间</th>
                             <th style="padding: 0.5rem; text-align: left;">状态</th>
-                            <th style="padding: 0.5rem; text-align: left;">消息</th>
                         </tr>
                     </thead>
                     <tbody>
-                        ${accountLogs.map(log => {
+                        ${accountLogs.map((log, index) => {
+                            const accountId = `account-${logId}-${index}`;
+                            const isExpanded = expandedAccounts.has(accountId);
                             const statusClass = log.status === 'success' ? 'status-available' : 
                                               log.status === 'error' ? 'status-unavailable' : 
-                                              log.status === 'cancelled' ? 'status-unknown' : 'status-unknown';
+                                              log.status === 'cancelled' ? 'status-unknown' : 'status-running';
                             const statusText = log.status === 'success' ? '成功' : 
                                               log.status === 'error' ? '失败' : 
                                               log.status === 'cancelled' ? '已中断' : '执行中';
@@ -796,21 +686,47 @@
                                 second: '2-digit'
                             }) : '-';
                             
+                            // 解析消息中的详细日志
+                            const detailLines = log.message ? log.message.split('\n').filter(line => line.trim()) : [];
+                            const hasDetails = detailLines.length > 0;
+                            
                             return `
                                 <tr style="border-bottom: 1px solid rgba(255, 255, 255, 0.05);">
+                                    <td style="padding: 0.5rem; text-align: center;">
+                                        ${hasDetails ? `<button onclick="toggleAccountDetail('${accountId}')" style="background: none; border: none; color: var(--text-secondary); cursor: pointer; font-size: 0.875rem; padding: 0.25rem;">${isExpanded ? '▼' : '▶'}</button>` : ''}
+                                    </td>
                                     <td style="padding: 0.5rem;">${(log.account_name || log.account_email || '-').replace(/</g, '&lt;').replace(/>/g, '&gt;')}</td>
                                     <td style="padding: 0.5rem;">${startTime}</td>
                                     <td style="padding: 0.5rem;">${endTime}</td>
                                     <td style="padding: 0.5rem;"><span class="status-badge ${statusClass}">${statusText}</span></td>
-                                    <td style="padding: 0.5rem; max-width: 200px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;" title="${(log.message || '').replace(/"/g, '&quot;')}">
-                                        ${(log.message || '-').replace(/</g, '&lt;').replace(/>/g, '&gt;')}
-                                    </td>
                                 </tr>
+                                ${isExpanded && hasDetails ? `
+                                    <tr id="${accountId}-detail" style="background: rgba(15, 23, 42, 0.3);">
+                                        <td colspan="5" style="padding: 1rem;">
+                                            <div style="font-family: 'Consolas', 'Monaco', 'Courier New', monospace; font-size: 0.75rem; line-height: 1.8; color: var(--text-secondary); white-space: pre-wrap; word-break: break-word;">
+                                                ${detailLines.map(line => {
+                                                    let color = 'var(--text-secondary)';
+                                                    if (line.includes('✅')) color = '#10b981';
+                                                    else if (line.includes('❌')) color = '#ef4444';
+                                                    else if (line.includes('🛑')) color = '#f59e0b';
+                                                    else if (line.includes('⏳')) color = '#3b82f6';
+                                                    return `<div style="color: ${color};">${escapeHtml(line)}</div>`;
+                                                }).join('')}
+                                            </div>
+                                        </td>
+                                    </tr>
+                                ` : ''}
                             `;
                         }).join('')}
                     </tbody>
                 </table>
             `;
+        }
+        
+        function escapeHtml(text) {
+            const div = document.createElement('div');
+            div.textContent = text;
+            return div.innerHTML;
         }
 
         // 页面加载时加载保活任务
@@ -818,6 +734,10 @@
             notifyParentModalOpen();
             keepAliveTaskRendered = false; // 重置渲染标记
             loadKeepAliveTask();
+            // 检查是否有正在执行的任务，如果有则自动加载
+            setTimeout(() => {
+                autoLoadRunningLog();
+            }, 1000);
         });
         
         // 页面卸载时通知父窗口

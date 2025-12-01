@@ -26,7 +26,7 @@ from apscheduler.triggers.cron import CronTrigger
 import subprocess
 import sys
 
-from database import init_db, get_db, Admin, APIKey, APICallLog, KeepAliveTask, KeepAliveLog, KeepAliveAccountLog
+from database import init_db, get_db, Admin, APIKey, APICallLog, KeepAliveTask, KeepAliveLog, KeepAliveAccountLog, AccountCookieStatus
 from auth import (
     hash_password, verify_password, create_access_token, 
     generate_api_key, hash_api_key, get_current_admin, init_admin,
@@ -310,6 +310,79 @@ class JWTManager:
                 self.account.mark_quota_error(r.status_code, r.text)
             raise HTTPException(r.status_code, "getoxsrf failed")
 
+        # 尝试从响应头中解析 Cookie 过期时间
+        cookie_expires_at = None
+        try:
+            # 检查响应头中是否有 Set-Cookie
+            logger.debug(f"检查响应头中的 Set-Cookie...")
+            logger.debug(f"所有响应头: {dict(r.headers)}")
+            
+            # httpx 使用 get_list 或 getall 获取所有同名头部
+            set_cookie_headers = []
+            if hasattr(r.headers, 'get_list'):
+                set_cookie_headers = r.headers.get_list("set-cookie", [])
+            elif hasattr(r.headers, 'getall'):
+                set_cookie_headers = r.headers.getall("set-cookie", [])
+            else:
+                # 如果没有这些方法，尝试直接获取
+                set_cookie_header = r.headers.get("set-cookie")
+                if set_cookie_header:
+                    set_cookie_headers = [set_cookie_header]
+            
+            logger.debug(f"找到 {len(set_cookie_headers)} 个 Set-Cookie 头")
+            
+            if set_cookie_headers:
+                from http.cookies import SimpleCookie
+                from database import get_beijing_time
+                for set_cookie in set_cookie_headers:
+                    try:
+                        # 解析 Set-Cookie 头
+                        cookie_obj = SimpleCookie()
+                        cookie_obj.load(set_cookie)
+                        for cookie_name, cookie_attrs in cookie_obj.items():
+                            if cookie_name in ("__Secure-C_SES", "__Host-C_OSES"):
+                                # 检查 Expires 属性
+                                if "expires" in cookie_attrs:
+                                    expires_str = cookie_attrs["expires"]
+                                    try:
+                                        # 解析 RFC 1123 格式的日期（GMT/UTC）
+                                        # 注意：需要处理时区，转换为北京时间（naive）
+                                        from email.utils import parsedate_to_datetime
+                                        expires_dt = parsedate_to_datetime(expires_str)
+                                        # 转换为北京时间（naive）
+                                        if expires_dt.tzinfo:
+                                            expires_dt = expires_dt.astimezone(timezone(timedelta(hours=8)))
+                                            cookie_expires_at = expires_dt.replace(tzinfo=None)
+                                        else:
+                                            cookie_expires_at = expires_dt
+                                        logger.debug(f"从 Set-Cookie 解析到过期时间: {cookie_expires_at}")
+                                        break
+                                    except (ValueError, TypeError) as e:
+                                        logger.debug(f"解析 Expires 失败: {e}")
+                                # 检查 Max-Age 属性
+                                elif "max-age" in cookie_attrs:
+                                    try:
+                                        max_age = int(cookie_attrs["max-age"])
+                                        # 使用北京时间
+                                        cookie_expires_at = get_beijing_time() + timedelta(seconds=max_age)
+                                        logger.debug(f"从 Max-Age 计算过期时间: {cookie_expires_at}")
+                                        break
+                                    except (ValueError, TypeError) as e:
+                                        logger.debug(f"解析 Max-Age 失败: {e}")
+                    except Exception as e:
+                        logger.debug(f"解析 Set-Cookie 失败: {e}")
+            else:
+                logger.debug(f"响应头中没有 Set-Cookie，Google API 可能不会在每次请求时返回 Cookie 过期信息")
+        except Exception as e:
+            logger.debug(f"获取 Set-Cookie 响应头失败: {e}")
+        
+        # 如果无法从响应头获取，保存到 account 对象供后续使用
+        if cookie_expires_at:
+            self.account._cookie_expires_at = cookie_expires_at
+            logger.info(f"✅ 成功获取 Cookie 过期时间 [{self.account.name}]: {cookie_expires_at}")
+        else:
+            logger.debug(f"⚠️ 无法从响应头获取 Cookie 过期时间 [{self.account.name}]")
+
         txt = r.text[4:] if r.text.startswith(")]}'") else r.text
         data = json.loads(txt)
 
@@ -334,6 +407,7 @@ class Account:
         self.csesidx = csesidx
         self.config_id = config_id
         self.jwt_mgr = JWTManager(self)
+        self._cookie_expires_at = None  # Cookie 过期时间（如果可获取）
         self.disabled_until: float = 0.0
 
     def is_available(self) -> bool:
@@ -1461,13 +1535,20 @@ class AccountResponse(BaseModel):
     config_id: str
     host_c_oses: str
     status: Optional[str] = None  # 测试状态
+    cookie_status: Optional[str] = None  # Cookie 状态: valid, expired, unknown
+    last_check_at: Optional[datetime] = None  # 最后检查时间
+    expires_at: Optional[datetime] = None  # 预估到期时间（如果可获取）
+    error_message: Optional[str] = None  # 错误信息（如果过期）
 
 
 @app.get("/admin/accounts", response_model=List[AccountResponse])
 async def list_accounts(
-    admin: Admin = Depends(get_current_admin)
+    admin: Admin = Depends(get_current_admin),
+    db: Session = Depends(get_db)
 ):
     """列出所有账号配置"""
+    from database import AccountCookieStatus
+    
     lines = read_env_file()
     accounts = parse_accounts_from_env_lines(lines)
     
@@ -1477,9 +1558,25 @@ async def list_accounts(
         for acc in ACCOUNT_POOL.accounts:
             account_status[acc.name] = "available" if acc.is_available() else "unavailable"
     
+    # 从数据库获取 Cookie 状态
+    cookie_status_map = {}
+    cookie_statuses = db.query(AccountCookieStatus).all()
+    logger.debug(f"从数据库读取到 {len(cookie_statuses)} 条 Cookie 状态记录")
+    for cs in cookie_statuses:
+        cookie_status_map[cs.account_name] = {
+            "cookie_status": cs.cookie_status,
+            "last_check_at": cs.last_check_at,
+            "expires_at": cs.expires_at,
+            "error_message": cs.error_message
+        }
+        if cs.last_check_at:
+            logger.debug(f"账号 {cs.account_name} 的最后检查时间: {cs.last_check_at}")
+    
     result = []
     for acc in accounts:
         status = account_status.get(acc["name"], "unknown")
+        cookie_info = cookie_status_map.get(acc["name"], {})
+        
         result.append(AccountResponse(
             index=acc["index"],
             name=acc["name"],
@@ -1487,7 +1584,11 @@ async def list_accounts(
             csesidx=acc["csesidx"],
             config_id=acc["config_id"],
             host_c_oses=acc.get("host_c_oses", ""),
-            status=status
+            status=status,
+            cookie_status=cookie_info.get("cookie_status"),
+            last_check_at=cookie_info.get("last_check_at"),
+            expires_at=cookie_info.get("expires_at"),
+            error_message=cookie_info.get("error_message")
         ))
     
     return result
@@ -2175,15 +2276,27 @@ async def bulk_delete_accounts(
 class KeepAliveTaskRequest(BaseModel):
     is_enabled: bool
     schedule_time: str  # HH:MM 格式
+    api_keepalive_enabled: bool = True  # API 保活是否启用
+    api_keepalive_interval: int = 30  # API 保活间隔（分钟）
+    auto_check_enabled: bool = False  # 自动检查是否启用
+    auto_check_interval: int = 60  # 自动检查间隔（分钟）
+    auto_check_auto_fix: bool = True  # 检测到无效时自动修复
 
 
 class KeepAliveTaskResponse(BaseModel):
     id: int
     is_enabled: bool
     schedule_time: str
+    api_keepalive_enabled: bool
+    api_keepalive_interval: int
+    auto_check_enabled: bool = False
+    auto_check_interval: int = 60
+    auto_check_auto_fix: bool = True
     last_run_at: Optional[datetime]
     last_status: Optional[str]
     last_message: Optional[str]
+    last_api_keepalive_at: Optional[datetime]
+    last_auto_check_at: Optional[datetime] = None
     created_at: datetime
     updated_at: datetime
 
@@ -2213,7 +2326,9 @@ async def get_keep_alive_task(
         # 创建默认任务
         task = KeepAliveTask(
             is_enabled=True,
-            schedule_time="00:00"
+            schedule_time="00:00",
+            api_keepalive_enabled=True,
+            api_keepalive_interval=30
         )
         db.add(task)
         db.commit()
@@ -2255,9 +2370,16 @@ async def get_keep_alive_task(
         id=task.id,
         is_enabled=task.is_enabled,
         schedule_time=task.schedule_time,
+        api_keepalive_enabled=getattr(task, 'api_keepalive_enabled', True),
+        api_keepalive_interval=getattr(task, 'api_keepalive_interval', 30),
+        auto_check_enabled=getattr(task, 'auto_check_enabled', False),
+        auto_check_interval=getattr(task, 'auto_check_interval', 60),
+        auto_check_auto_fix=getattr(task, 'auto_check_auto_fix', True),
         last_run_at=task.last_run_at,
         last_status=task.last_status,
         last_message=task.last_message,
+        last_api_keepalive_at=getattr(task, 'last_api_keepalive_at', None),
+        last_auto_check_at=getattr(task, 'last_auto_check_at', None),
         created_at=task.created_at,
         updated_at=task.updated_at
     )
@@ -2278,16 +2400,34 @@ async def update_keep_alive_task(
     except (ValueError, AttributeError):
         raise HTTPException(status_code=400, detail="时间格式错误，应为 HH:MM (24小时制)")
     
+    # 验证 API 保活间隔
+    if req.api_keepalive_interval < 5 or req.api_keepalive_interval > 1440:
+        raise HTTPException(status_code=400, detail="API 保活间隔必须在 5-1440 分钟之间")
+    
+    # 验证自动检查间隔
+    if req.auto_check_interval < 5 or req.auto_check_interval > 1440:
+        raise HTTPException(status_code=400, detail="自动检查间隔必须在 5-1440 分钟之间")
+    
     task = db.query(KeepAliveTask).first()
     if not task:
         task = KeepAliveTask(
             is_enabled=req.is_enabled,
-            schedule_time=req.schedule_time
+            schedule_time=req.schedule_time,
+            api_keepalive_enabled=req.api_keepalive_enabled,
+            api_keepalive_interval=req.api_keepalive_interval,
+            auto_check_enabled=req.auto_check_enabled,
+            auto_check_interval=req.auto_check_interval,
+            auto_check_auto_fix=req.auto_check_auto_fix
         )
         db.add(task)
     else:
         task.is_enabled = req.is_enabled
         task.schedule_time = req.schedule_time
+        task.api_keepalive_enabled = req.api_keepalive_enabled
+        task.api_keepalive_interval = req.api_keepalive_interval
+        task.auto_check_enabled = req.auto_check_enabled
+        task.auto_check_interval = req.auto_check_interval
+        task.auto_check_auto_fix = req.auto_check_auto_fix
         task.updated_at = get_beijing_time()
     
     db.commit()
@@ -2296,6 +2436,8 @@ async def update_keep_alive_task(
     # 重新设置调度器
     try:
         scheduler.remove_job("keep_alive_task")
+        scheduler.remove_job("api_keepalive_task")
+        scheduler.remove_job("auto_check_task")
     except Exception:
         # 如果任务不存在，忽略错误
         pass
@@ -2316,13 +2458,46 @@ async def update_keep_alive_task(
     else:
         logger.info("ℹ️ 保活任务已禁用")
     
+    # 设置 API 保活调度器
+    if task.api_keepalive_enabled:
+        try:
+            scheduler.add_job(
+                execute_api_keepalive_task,
+                trigger=CronTrigger(minute=f"*/{task.api_keepalive_interval}", timezone=BEIJING_TZ),
+                id="api_keepalive_task",
+                replace_existing=True
+            )
+            logger.info(f"✅ API 保活任务已设置，每 {task.api_keepalive_interval} 分钟执行一次")
+        except Exception as e:
+            logger.error(f"❌ 设置 API 保活调度器失败: {e}")
+    else:
+        logger.info("ℹ️ API 保活任务已禁用")
+    
+    # 设置自动检查调度器
+    if task.auto_check_enabled:
+        try:
+            scheduler.add_job(
+                execute_auto_check_task,
+                trigger=CronTrigger(minute=f"*/{task.auto_check_interval}", timezone=BEIJING_TZ),
+                id="auto_check_task",
+                replace_existing=True
+            )
+            logger.info(f"✅ 自动检查任务已设置，每 {task.auto_check_interval} 分钟执行一次")
+        except Exception as e:
+            logger.error(f"❌ 设置自动检查调度器失败: {e}")
+    else:
+        logger.info("ℹ️ 自动检查任务已禁用")
+    
     return KeepAliveTaskResponse(
         id=task.id,
         is_enabled=task.is_enabled,
         schedule_time=task.schedule_time,
+        api_keepalive_enabled=task.api_keepalive_enabled,
+        api_keepalive_interval=task.api_keepalive_interval,
         last_run_at=task.last_run_at,
         last_status=task.last_status,
         last_message=task.last_message,
+        last_api_keepalive_at=getattr(task, 'last_api_keepalive_at', None),
         created_at=task.created_at,
         updated_at=task.updated_at
     )
@@ -2577,12 +2752,151 @@ async def get_keep_alive_status(
     }
 
 
+@app.post("/admin/auto-check/execute")
+async def execute_auto_check_now(
+    admin: Admin = Depends(get_current_admin)
+):
+    """立即执行自动检查任务"""
+    try:
+        # 在后台执行自动检查任务
+        asyncio.create_task(execute_auto_check_task())
+        return {"message": "自动检查任务已开始执行"}
+    except Exception as e:
+        logger.error(f"执行自动检查失败: {e}")
+        raise HTTPException(status_code=500, detail=f"执行失败: {str(e)}")
+
+
+@app.post("/admin/accounts/batch-check")
+async def batch_check_accounts(
+    admin: Admin = Depends(get_current_admin),
+    db: Session = Depends(get_db)
+):
+    """批量检查所有账号的 Cookie 状态（API 保活）"""
+    lines = read_env_file()
+    accounts = parse_accounts_from_env_lines(lines)
+    
+    results = []
+    check_time = get_beijing_time()
+    
+    for acc in accounts:
+        test_acc = Account(
+            name=acc["name"],
+            secure_c_ses=acc["secure_c_ses"],
+            csesidx=acc["csesidx"],
+            config_id=acc["config_id"],
+            host_c_oses=acc.get("host_c_oses", ""),
+        )
+        
+        cookie_status = "unknown"
+        error_msg = None
+        expires_at = None
+        
+        try:
+            jwt_token = await test_acc.jwt_mgr.get()
+            if jwt_token:
+                cookie_status = "valid"
+                # 尝试获取 Cookie 过期时间（仅从响应头获取，不估算）
+                if hasattr(test_acc, '_cookie_expires_at') and test_acc._cookie_expires_at:
+                    expires_at = test_acc._cookie_expires_at
+                # 如果无法从响应头获取，expires_at 保持为 None
+                
+                result_item = {
+                    "index": acc["index"],
+                    "name": acc["name"],
+                    "cookie_status": cookie_status,
+                    "last_check_at": check_time,
+                    "expires_at": expires_at,
+                    "error_message": None
+                }
+            else:
+                cookie_status = "unknown"
+                error_msg = "无法获取 JWT"
+                result_item = {
+                    "index": acc["index"],
+                    "name": acc["name"],
+                    "cookie_status": cookie_status,
+                    "last_check_at": check_time,
+                    "expires_at": None,
+                    "error_message": error_msg
+                }
+        except HTTPException as e:
+            error_msg = str(e.detail) if hasattr(e, 'detail') else str(e)
+            if e.status_code == 401:
+                cookie_status = "expired"
+                error_msg = "Cookie 已过期"
+            elif e.status_code == 403:
+                cookie_status = "forbidden"
+                error_msg = "Cookie 无效或被禁止"
+            elif e.status_code == 429:
+                cookie_status = "rate_limited"
+                error_msg = "请求过于频繁"
+            
+            result_item = {
+                "index": acc["index"],
+                "name": acc["name"],
+                "cookie_status": cookie_status,
+                "last_check_at": check_time,
+                "expires_at": None,
+                "error_message": error_msg
+            }
+        except Exception as e:
+            error_msg = str(e)
+            result_item = {
+                "index": acc["index"],
+                "name": acc["name"],
+                "cookie_status": "unknown",
+                "last_check_at": check_time,
+                "expires_at": None,
+                "error_message": error_msg
+            }
+        
+        results.append(result_item)
+        
+        # 保存到数据库
+        try:
+            account_status = db.query(AccountCookieStatus).filter(
+                AccountCookieStatus.account_name == acc["name"]
+            ).first()
+            
+            if account_status:
+                # 更新现有记录
+                account_status.cookie_status = cookie_status
+                account_status.last_check_at = check_time
+                # 只有在 Cookie 有效时才更新过期时间，避免覆盖有效的过期时间
+                if cookie_status == "valid" and expires_at:
+                    account_status.expires_at = expires_at
+                account_status.error_message = error_msg
+                account_status.updated_at = check_time
+            else:
+                # 创建新记录
+                account_status = AccountCookieStatus(
+                    account_name=acc["name"],
+                    cookie_status=cookie_status,
+                    last_check_at=check_time,
+                    expires_at=expires_at if cookie_status == "valid" else None,
+                    error_message=error_msg
+                )
+                db.add(account_status)
+        except Exception as e:
+            logger.error(f"保存账号 Cookie 状态失败 [{acc['name']}]: {e}")
+    
+    # 批量提交
+    try:
+        db.commit()
+    except Exception as e:
+        logger.error(f"批量保存 Cookie 状态失败: {e}")
+        db.rollback()
+    
+    return {"results": results}
+
+
 @app.post("/admin/accounts/{account_index}/test")
 async def test_account(
     account_index: int,
-    admin: Admin = Depends(get_current_admin)
+    admin: Admin = Depends(get_current_admin),
+    db: Session = Depends(get_db)
 ):
-    """测试账号是否可用"""
+    """测试账号是否可用（API 保活检查）"""
     lines = read_env_file()
     accounts = parse_accounts_from_env_lines(lines)
     
@@ -2605,16 +2919,108 @@ async def test_account(
         host_c_oses=target_account.get("host_c_oses", ""),
     )
     
+    check_time = get_beijing_time()
+    cookie_status = "unknown"
+    error_msg = None
+    expires_at = None
+    
     try:
-        # 尝试获取 JWT
+        # 尝试获取 JWT（这会验证 Cookie 是否有效）
         jwt_token = await test_acc.jwt_mgr.get()
         if jwt_token:
-            return {"status": "success", "message": "账号测试成功，JWT 获取正常"}
+            cookie_status = "valid"
+            
+            # 尝试获取 Cookie 过期时间（仅从响应头获取，不估算）
+            if hasattr(test_acc, '_cookie_expires_at') and test_acc._cookie_expires_at:
+                expires_at = test_acc._cookie_expires_at
+            # 如果无法从响应头获取，expires_at 保持为 None
+            
+            result = {
+                "status": "success",
+                "message": "账号测试成功，Cookie 有效",
+                "cookie_status": cookie_status,
+                "last_check_at": check_time,
+                "expires_at": expires_at,
+                "error_message": None
+            }
         else:
-            return {"status": "error", "message": "无法获取 JWT"}
+            cookie_status = "unknown"
+            error_msg = "无法获取 JWT"
+            result = {
+                "status": "error",
+                "message": "无法获取 JWT",
+                "cookie_status": cookie_status,
+                "last_check_at": check_time,
+                "expires_at": None,
+                "error_message": error_msg
+            }
+    except HTTPException as e:
+        # 根据错误码判断 Cookie 状态
+        error_msg = str(e.detail) if hasattr(e, 'detail') else str(e)
+        
+        if e.status_code == 401:
+            cookie_status = "expired"
+            error_msg = "Cookie 已过期，需要重新登录"
+        elif e.status_code == 403:
+            cookie_status = "forbidden"
+            error_msg = "Cookie 无效或被禁止访问"
+        elif e.status_code == 429:
+            cookie_status = "rate_limited"
+            error_msg = "请求过于频繁，请稍后再试"
+        
+        logger.error(f"账号测试失败 [{target_account['name']}]: {e.status_code} - {error_msg}")
+        result = {
+            "status": "error",
+            "message": f"账号测试失败: {error_msg}",
+            "cookie_status": cookie_status,
+            "last_check_at": check_time,
+            "expires_at": None,
+            "error_message": error_msg
+        }
     except Exception as e:
         logger.error(f"账号测试失败: {e}")
-        return {"status": "error", "message": f"账号测试失败: {str(e)}"}
+        error_msg = str(e)
+        result = {
+            "status": "error",
+            "message": f"账号测试失败: {error_msg}",
+            "cookie_status": "unknown",
+            "last_check_at": check_time,
+            "expires_at": None,
+            "error_message": error_msg
+        }
+    
+    # 保存到数据库
+    try:
+        account_status = db.query(AccountCookieStatus).filter(
+            AccountCookieStatus.account_name == target_account["name"]
+        ).first()
+        
+        if account_status:
+            # 更新现有记录
+            account_status.cookie_status = cookie_status
+            account_status.last_check_at = check_time
+            # 只有在 Cookie 有效时才更新过期时间，避免覆盖有效的过期时间
+            if cookie_status == "valid" and expires_at:
+                account_status.expires_at = expires_at
+            account_status.error_message = error_msg
+            account_status.updated_at = check_time
+        else:
+            # 创建新记录
+            account_status = AccountCookieStatus(
+                account_name=target_account["name"],
+                cookie_status=cookie_status,
+                last_check_at=check_time,
+                expires_at=expires_at if cookie_status == "valid" else None,
+                error_message=error_msg
+            )
+            db.add(account_status)
+        
+        db.commit()
+    except Exception as e:
+        logger.error(f"保存账号 Cookie 状态失败: {e}")
+        db.rollback()
+    
+    return result
 
 
 # ---------- API 密钥验证中间件 ----------
@@ -3386,6 +3792,314 @@ current_keep_alive_process: Optional[subprocess.Popen] = None
 keep_alive_process_lock = asyncio.Lock()
 
 
+async def execute_api_keepalive_task():
+    """执行 API 保活任务 - 通过调用 Gemini API 保持会话活跃"""
+    db = next(get_db())
+    try:
+        task = db.query(KeepAliveTask).first()
+        if not task or not getattr(task, 'api_keepalive_enabled', True):
+            logger.debug("API 保活任务已禁用，跳过执行")
+            return
+        
+        logger.info("🔄 开始执行 API 保活任务...")
+        
+        if ACCOUNT_POOL is None or not ACCOUNT_POOL.accounts:
+            logger.warning("⚠️ 没有可用账号，跳过 API 保活")
+            return
+        
+        # 重新加载账号配置
+        try:
+            reload_accounts_from_env_file()
+        except Exception as e:
+            logger.warning(f"⚠️ 重新加载账号配置失败: {e}")
+        
+        success_count = 0
+        fail_count = 0
+        total_accounts = len(ACCOUNT_POOL.accounts)
+        invalid_accounts = []  # 记录无效的账号，用于自动修复
+        check_time = ensure_naive(get_beijing_time())  # 转换为 naive datetime 用于数据库存储
+        
+        # 对每个账号执行一次简单的 API 调用
+        for account in ACCOUNT_POOL.accounts:
+            if not account.is_available():
+                logger.debug(f"⏭️ 跳过不可用账号: {account.name}")
+                fail_count += 1
+                continue
+            
+            cookie_status = "unknown"
+            error_msg = None
+            expires_at = None
+            
+            try:
+                # 只验证 JWT 是否有效，通过刷新 JWT 来保持会话活跃
+                # 这种方式更轻量，不会产生实际的 API 调用
+                jwt = await account.jwt_mgr.get()
+                if jwt:
+                    cookie_status = "valid"
+                    success_count += 1
+                    logger.debug(f"✅ API 保活成功: {account.name} (JWT 刷新)")
+                    
+                    # 尝试获取 Cookie 过期时间（仅从响应头获取，不估算）
+                    if hasattr(account, '_cookie_expires_at') and account._cookie_expires_at:
+                        expires_at = account._cookie_expires_at
+                else:
+                    cookie_status = "unknown"
+                    error_msg = "无法获取 JWT"
+                    fail_count += 1
+                    logger.warning(f"⚠️ API 保活失败 [{account.name}]: 无法获取 JWT")
+                    invalid_accounts.append(account.name)
+                        
+            except HTTPException as e:
+                fail_count += 1
+                error_msg = str(e.detail) if hasattr(e, 'detail') else str(e)
+                if e.status_code in (401, 403):
+                    # Cookie 无效，记录到待修复列表
+                    if e.status_code == 401:
+                        cookie_status = "expired"
+                        error_msg = "Cookie 已过期"
+                    elif e.status_code == 403:
+                        cookie_status = "forbidden"
+                        error_msg = "Cookie 无效或被禁止"
+                    account.mark_quota_error(e.status_code, str(e.detail))
+                    invalid_accounts.append(account.name)
+                    logger.warning(f"⚠️ Cookie 无效 [{account.name}]: {e.status_code} - 将自动修复")
+                elif e.status_code == 429:
+                    cookie_status = "rate_limited"
+                    error_msg = "请求过于频繁"
+                    account.mark_quota_error(e.status_code, str(e.detail))
+                    logger.warning(f"⚠️ API 保活失败 [{account.name}]: 请求过于频繁")
+                else:
+                    logger.warning(f"⚠️ API 保活失败 [{account.name}]: {e.status_code}")
+            except Exception as e:
+                fail_count += 1
+                error_msg = str(e)
+                logger.warning(f"⚠️ API 保活异常 [{account.name}]: {str(e)}")
+            
+            # 保存检查结果到数据库
+            try:
+                account_status = db.query(AccountCookieStatus).filter(
+                    AccountCookieStatus.account_name == account.name
+                ).first()
+                
+                if account_status:
+                    # 更新现有记录
+                    account_status.cookie_status = cookie_status
+                    account_status.last_check_at = check_time
+                    # 只有在 Cookie 有效时才更新过期时间，避免覆盖有效的过期时间
+                    if cookie_status == "valid" and expires_at:
+                        account_status.expires_at = expires_at
+                    account_status.error_message = error_msg
+                    account_status.updated_at = check_time
+                else:
+                    # 创建新记录
+                    account_status = AccountCookieStatus(
+                        account_name=account.name,
+                        cookie_status=cookie_status,
+                        last_check_at=check_time,
+                        expires_at=expires_at if cookie_status == "valid" else None,
+                        error_message=error_msg
+                    )
+                    db.add(account_status)
+            except Exception as e:
+                logger.error(f"保存账号 Cookie 状态失败 [{account.name}]: {e}")
+        
+        # 批量提交所有账号状态更新
+        try:
+            db.commit()
+            logger.debug(f"✅ 已保存 {total_accounts} 个账号的 Cookie 状态到数据库")
+        except Exception as e:
+            logger.error(f"批量保存 Cookie 状态失败: {e}")
+            db.rollback()
+        
+        # 如果启用了自动修复，且检测到无效账号，则调用浏览器保活来修复
+        if invalid_accounts and getattr(task, 'auto_check_auto_fix', True):
+            logger.info(f"🔧 检测到 {len(invalid_accounts)} 个无效账号，开始自动修复: {', '.join(invalid_accounts)}")
+            try:
+                # 调用浏览器保活来修复这些账号
+                # 注意：这里只修复无效的账号，有效的账号不处理
+                await execute_keep_alive_task_for_accounts(invalid_accounts)
+                logger.info(f"✅ 自动修复完成: {len(invalid_accounts)} 个账号")
+            except Exception as e:
+                logger.error(f"❌ 自动修复失败: {e}")
+        
+        # 更新任务状态（与 Cookie 状态一起提交）
+        task.last_api_keepalive_at = get_beijing_time()
+        task.last_message = f"API 保活完成: 成功 {success_count}/{total_accounts}"
+        
+        # 再次提交任务状态（如果之前已经提交过，这里会更新任务状态）
+        try:
+            db.commit()
+            logger.info(f"✅ API 保活任务完成: 成功 {success_count}/{total_accounts}，已更新 Cookie 状态")
+        except Exception as e:
+            logger.error(f"更新任务状态失败: {e}")
+            db.rollback()
+        
+    except Exception as e:
+        logger.error(f"❌ API 保活任务执行失败: {e}")
+        if task:
+            task.last_message = f"API 保活失败: {str(e)}"
+            db.commit()
+    finally:
+        db.close()
+
+
+async def execute_keep_alive_task_for_accounts(account_names: List[str] = None):
+    """
+    执行保活任务（仅针对指定的账号）
+    
+    Args:
+        account_names: 要处理的账号名称列表，如果为 None 则处理所有账号
+    """
+    global current_keep_alive_process
+    
+    # 如果指定了账号列表，需要修改 keep_alive_env.py 来只处理这些账号
+    # 这里我们通过环境变量传递账号列表
+    if account_names:
+        import json
+        os.environ['KEEP_ALIVE_TARGET_ACCOUNTS'] = json.dumps(account_names)
+        logger.info(f"🎯 保活任务将只处理以下账号: {', '.join(account_names)}")
+    else:
+        os.environ.pop('KEEP_ALIVE_TARGET_ACCOUNTS', None)
+    
+    # 调用原有的保活任务
+    await execute_keep_alive_task()
+
+
+async def execute_auto_check_task():
+    """执行自动检查任务 - 检查所有账号的 Cookie 状态，如果无效则自动修复"""
+    db = next(get_db())
+    try:
+        task = db.query(KeepAliveTask).first()
+        if not task or not getattr(task, 'auto_check_enabled', False):
+            logger.debug("自动检查任务已禁用，跳过执行")
+            return
+        
+        logger.info("🔍 开始执行自动检查任务...")
+        
+        if ACCOUNT_POOL is None or not ACCOUNT_POOL.accounts:
+            logger.warning("⚠️ 没有可用账号，跳过自动检查")
+            return
+        
+        # 重新加载账号配置
+        try:
+            reload_accounts_from_env_file()
+        except Exception as e:
+            logger.warning(f"⚠️ 重新加载账号配置失败: {e}")
+        
+        invalid_accounts = []  # 记录无效的账号
+        valid_count = 0
+        total_accounts = len(ACCOUNT_POOL.accounts)
+        check_time = ensure_naive(get_beijing_time())  # 转换为 naive datetime 用于数据库存储
+        
+        # 检查每个账号的 Cookie 状态
+        for account in ACCOUNT_POOL.accounts:
+            if not account.is_available():
+                logger.debug(f"⏭️ 跳过不可用账号: {account.name}")
+                continue
+            
+            cookie_status = "unknown"
+            error_msg = None
+            expires_at = None
+            
+            try:
+                # 验证 JWT 是否有效
+                jwt = await account.jwt_mgr.get()
+                if jwt:
+                    cookie_status = "valid"
+                    valid_count += 1
+                    logger.debug(f"✅ Cookie 有效: {account.name}")
+                    
+                    # 尝试获取 Cookie 过期时间（仅从响应头获取，不估算）
+                    if hasattr(account, '_cookie_expires_at') and account._cookie_expires_at:
+                        expires_at = account._cookie_expires_at
+                else:
+                    cookie_status = "unknown"
+                    error_msg = "无法获取 JWT"
+                    invalid_accounts.append(account.name)
+                    logger.warning(f"⚠️ Cookie 无效 [{account.name}]: 无法获取 JWT")
+                        
+            except HTTPException as e:
+                error_msg = str(e.detail) if hasattr(e, 'detail') else str(e)
+                if e.status_code in (401, 403):
+                    # Cookie 无效
+                    if e.status_code == 401:
+                        cookie_status = "expired"
+                        error_msg = "Cookie 已过期"
+                    elif e.status_code == 403:
+                        cookie_status = "forbidden"
+                        error_msg = "Cookie 无效或被禁止"
+                    invalid_accounts.append(account.name)
+                    logger.warning(f"⚠️ Cookie 无效 [{account.name}]: {e.status_code}")
+                elif e.status_code == 429:
+                    cookie_status = "rate_limited"
+                    error_msg = "请求过于频繁"
+                    logger.warning(f"⚠️ 请求过于频繁 [{account.name}]")
+            except Exception as e:
+                error_msg = str(e)
+                logger.warning(f"⚠️ 检查异常 [{account.name}]: {str(e)}")
+            
+            # 保存检查结果到数据库
+            try:
+                account_status = db.query(AccountCookieStatus).filter(
+                    AccountCookieStatus.account_name == account.name
+                ).first()
+                
+                if account_status:
+                    # 更新现有记录
+                    account_status.cookie_status = cookie_status
+                    account_status.last_check_at = check_time
+                    # 只有在 Cookie 有效时才更新过期时间，避免覆盖有效的过期时间
+                    if cookie_status == "valid" and expires_at:
+                        account_status.expires_at = expires_at
+                    account_status.error_message = error_msg
+                    account_status.updated_at = check_time
+                else:
+                    # 创建新记录
+                    account_status = AccountCookieStatus(
+                        account_name=account.name,
+                        cookie_status=cookie_status,
+                        last_check_at=check_time,
+                        expires_at=expires_at if cookie_status == "valid" else None,
+                        error_message=error_msg
+                    )
+                    db.add(account_status)
+            except Exception as e:
+                logger.error(f"保存账号 Cookie 状态失败 [{account.name}]: {e}")
+        
+        # 批量提交所有账号状态更新
+        try:
+            db.commit()
+            logger.info(f"✅ 已保存 {total_accounts} 个账号的 Cookie 状态到数据库（最后检查时间: {check_time}）")
+        except Exception as e:
+            logger.error(f"批量保存 Cookie 状态失败: {e}")
+            db.rollback()
+        
+        # 如果启用了自动修复，且检测到无效账号，则调用浏览器保活来修复
+        if invalid_accounts and getattr(task, 'auto_check_auto_fix', True):
+            logger.info(f"🔧 检测到 {len(invalid_accounts)} 个无效账号，开始自动修复: {', '.join(invalid_accounts)}")
+            try:
+                # 调用浏览器保活来修复这些账号
+                await execute_keep_alive_task_for_accounts(invalid_accounts)
+                logger.info(f"✅ 自动修复完成: {len(invalid_accounts)} 个账号")
+            except Exception as e:
+                logger.error(f"❌ 自动修复失败: {e}")
+        
+        # 更新任务状态
+        task.last_auto_check_at = get_beijing_time()
+        task.last_message = f"自动检查完成: 有效 {valid_count}/{total_accounts}, 无效 {len(invalid_accounts)}"
+        db.commit()
+        
+        logger.info(f"✅ 自动检查任务完成: 有效 {valid_count}/{total_accounts}, 无效 {len(invalid_accounts)}")
+        
+    except Exception as e:
+        logger.error(f"❌ 自动检查任务执行失败: {e}")
+        if task:
+            task.last_message = f"自动检查失败: {str(e)}"
+            db.commit()
+    finally:
+        db.close()
+
+
 async def execute_keep_alive_task():
     """执行保活任务"""
     global current_keep_alive_process
@@ -3695,7 +4409,9 @@ def setup_keep_alive_scheduler():
         if not task:
             task = KeepAliveTask(
                 is_enabled=True,
-                schedule_time="00:00"
+                schedule_time="00:00",
+                api_keepalive_enabled=True,
+                api_keepalive_interval=30
             )
             db.add(task)
             db.commit()
@@ -3716,6 +4432,38 @@ def setup_keep_alive_scheduler():
             logger.info(f"✅ 保活任务已设置，每日 {task.schedule_time} (北京时间) 执行")
         else:
             logger.info("ℹ️ 保活任务已禁用")
+        
+        # 设置 API 保活调度器
+        if getattr(task, 'api_keepalive_enabled', True):
+            try:
+                interval = getattr(task, 'api_keepalive_interval', 30)
+                scheduler.add_job(
+                    execute_api_keepalive_task,
+                    trigger=CronTrigger(minute=f"*/{interval}", timezone=BEIJING_TZ),
+                    id="api_keepalive_task",
+                    replace_existing=True
+                )
+                logger.info(f"✅ API 保活任务已设置，每 {interval} 分钟执行一次")
+            except Exception as e:
+                logger.error(f"❌ 设置 API 保活调度器失败: {e}")
+        else:
+            logger.info("ℹ️ API 保活任务已禁用")
+        
+        # 设置自动检查调度器
+        if getattr(task, 'auto_check_enabled', False):
+            try:
+                interval = getattr(task, 'auto_check_interval', 60)
+                scheduler.add_job(
+                    execute_auto_check_task,
+                    trigger=CronTrigger(minute=f"*/{interval}", timezone=BEIJING_TZ),
+                    id="auto_check_task",
+                    replace_existing=True
+                )
+                logger.info(f"✅ 自动检查任务已设置，每 {interval} 分钟执行一次")
+            except Exception as e:
+                logger.error(f"❌ 设置自动检查调度器失败: {e}")
+        else:
+            logger.info("ℹ️ 自动检查任务已禁用")
             
     except Exception as e:
         logger.error(f"❌ 设置保活任务调度器失败: {e}")
